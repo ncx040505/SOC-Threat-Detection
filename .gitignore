@@ -1,35 +1,73 @@
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
+
+# Virtual env
 env/
 venv/
 ENV/
 env.bak/
 venv.bak/
+.venv/
+
+# Testing
+.pytest_cache/
+.tox/
+.coverage*
+htmlcov/
+
+# Packaging
 *.egg-info/
 dist/
 build/
 *.egg
 .eggs/
+
+# Wandb
 wandb/
+
+# Large model files
 *.h5
 *.keras
 *.joblib
+
+# Data — only keep gitkeeps
+data/raw/*
 !data/raw/.gitkeep
+data/processed/*
 !data/processed/.gitkeep
+data/splits/*
 !data/splits/.gitkeep
+
+# Outputs — only keep gitkeep
+outputs/*
 !outputs/.gitkeep
+
+# Models — only keep gitkeep
+models/*
 !models/.gitkeep
+
+# Visualizations — only keep gitkeep
 visualizations/*
 !visualizations/.gitkeep
+
+# Logs — only keep gitkeep
 logs/*
 !logs/.gitkeep
+
+# OS / Editor
 .DS_Store
 .idea/
 .vscode/
 *.swp
 *.swo
 *~
+
+# Jupyter
 .ipynb_checkpoints/
+
+# Backups
+*.bak
