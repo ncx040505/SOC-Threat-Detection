@@ -14,19 +14,13 @@ build/
 *.egg
 .eggs/
 wandb/
-*.pkl
 *.h5
 *.keras
 *.joblib
-data/raw/*
 !data/raw/.gitkeep
-data/processed/*
 !data/processed/.gitkeep
-data/splits/*
 !data/splits/.gitkeep
-outputs/*
 !outputs/.gitkeep
-models/*
 !models/.gitkeep
 visualizations/*
 !visualizations/.gitkeep
@@ -39,7 +33,3 @@ logs/*
 *.swo
 *~
 .ipynb_checkpoints/
-data/
-models/
-*.pkl
-outputs/res.csv

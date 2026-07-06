@@ -1,0 +1,12 @@
+{
+  "best_model_name": "mlp",
+  "best_score": 0.9999498969901405,
+  "model_names": [
+    "random_forest",
+    "xgboost",
+    "lightgbm",
+    "mlp"
+  ],
+  "has_ensemble": true,
+  "has_stacking": true
+}
