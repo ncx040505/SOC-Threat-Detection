@@ -1,0 +1,318 @@
+"""
+数据加载与预处理模块
+✅ v2.0: fit/transform 语义 — 保存缺失值统计、丢弃列、目标编码映射
+  - fit(): 分析训练集，记录缺失值统计、丢弃列、所有填充值
+  - transform(): 严格按照 fit 阶段的信息处理新数据
+  - 列名从 config.yaml columns 读取，不再硬编码
+"""
+from __future__ import annotations
+
+import logging
+import os
+import pickle
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import StratifiedShuffleSplit
+
+from src.config_loader import Config
+
+logger = logging.getLogger(__name__)
+
+
+class DataLoader:
+    """数据加载器 — 带 fit / transform 语义"""
+
+    def __init__(self, config: Config):
+        self.cfg = config
+
+        # ---- fit 阶段记录的统计信息 ----
+        self.fitted = False
+        self.drop_cols: List[str] = []             # 因缺失率过高丢弃的列
+        self.numeric_medians: Dict[str, float] = {} # 数值列中位数填充值
+        self.categorical_modes: Dict[str, str] = {} # 类别列众数填充值
+        self.label_encoder: Dict[str, int] = {}     # 标签 → 数值映射
+        self.label_decoder: Dict[int, str] = {}     # 数值 → 标签
+        self.feature_order: List[str] = []          # 训练时特征列顺序
+        self.id_col_overlap: List[str] = []         # id_cols 中保留不处理的列
+
+        # ---- 真实数据列名（从 config 读取） ----
+        self.id_cols = list(self.cfg.get("columns", {}).get("id_cols", ["event_id", "raw_message"]))
+        self.label_col = self.cfg.get("columns", {}).get("label_col", "label")
+        self.text_col = self.cfg.get("columns", {}).get("text_col", "raw_message")
+
+    # ================================================================
+    # 文件读取
+    # ================================================================
+    def _read_file(self, path: str) -> pd.DataFrame:
+        """读取 CSV 或 parquet 文件（根据扩展名自动识别）"""
+        path = os.path.expanduser(path)
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"文件不存在: {path}")
+
+        _, ext = os.path.splitext(path)
+        if ext.lower() == ".parquet":
+            df = pd.read_parquet(path)
+        else:
+            # CSV path
+            large = self.cfg.get("data", {}).get("large_dataset", False)
+            if large:
+                chunks = []
+                for chunk in pd.read_csv(path, chunksize=100000, low_memory=False):
+                    chunks.append(chunk)
+                df = pd.concat(chunks, ignore_index=True)
+            else:
+                df = pd.read_csv(path, low_memory=False)
+
+        # 删除全重复行
+        before = len(df)
+        df = df.drop_duplicates()
+        if len(df) < before:
+            logger.info("删除重复行: %d → %d", before, len(df))
+
+        return df
+
+    # ================================================================
+    # fit — 分析训练集，记录统计信息
+    # ================================================================
+    def fit(self, df: pd.DataFrame):
+        """
+        分析训练集：
+        - 高缺失率列记录
+        - 数值列中位数
+        - 类别列众数
+        - 标签编码
+        - 特征列顺序
+        """
+        logger.info("DataLoader fit — 分析训练集 (shape=%s)", df.shape)
+
+        # --- 标签编码 ---
+        if self.label_col in df.columns:
+            labels = df[self.label_col].dropna().unique()
+            for i, lbl in enumerate(sorted(labels)):
+                self.label_encoder[lbl] = i
+                self.label_decoder[i] = lbl
+            logger.info("标签编码: %s", self.label_decoder)
+        else:
+            logger.warning("训练集缺少标签列 '%s'", self.label_col)
+
+        # --- 确定哪些 id_cols 实际存在 ---
+        self.id_col_overlap = [c for c in self.id_cols if c in df.columns]
+        # text_col 也从 id 列中拆出来单独保留
+        if self.text_col in df.columns and self.text_col not in self.id_col_overlap:
+            self.id_col_overlap.append(self.text_col)
+
+        # --- 高缺失率列 ---
+        feature_candidates = [c for c in df.columns if c not in self.id_col_overlap and c != self.label_col]
+        missing_threshold = self.cfg.get("data", {}).get("missing_threshold", 0.6)
+        for col in feature_candidates:
+            missing_rate = df[col].isna().mean()
+            if missing_rate > missing_threshold:
+                self.drop_cols.append(col)
+                logger.info("丢弃高缺失率列: %s (缺失率 %.2f%%)", col, missing_rate * 100)
+
+        # --- 数值/类别统计 ---
+        keep_cols = [c for c in feature_candidates if c not in self.drop_cols]
+        for col in keep_cols:
+            if pd.api.types.is_numeric_dtype(df[col]):
+                med = df[col].median()
+                if pd.isna(med):
+                    med = 0.0
+                self.numeric_medians[col] = med
+            else:
+                mode_vals = df[col].mode(dropna=True)
+                mode_val = mode_vals.iloc[0] if len(mode_vals) > 0 else "UNKNOWN"
+                self.categorical_modes[col] = str(mode_val)
+
+        # --- 特征列顺序 ---
+        all_feature_cols = [c for c in df.columns if c not in self.id_col_overlap and c != self.label_col and c not in self.drop_cols]
+        self.feature_order = all_feature_cols
+
+        self.fitted = True
+        logger.info("DataLoader fit 完成 — %d 特征列, %d 丢弃列, %d ID列",
+                    len(self.feature_order), len(self.drop_cols), len(self.id_col_overlap))
+
+    # ================================================================
+    # transform — 用 fit 记录的统计信息处理数据
+    # ================================================================
+    def transform(self, df: pd.DataFrame, has_label: bool = True) -> Tuple[pd.DataFrame, Optional[pd.Series], Optional[pd.Series]]:
+        """
+        严格按 fit 信息处理数据。
+        返回: (X, y, ids_series)
+        """
+        if not self.fitted:
+            raise RuntimeError("DataLoader 尚未 fit，请先调用 fit()")
+
+        logger.info("DataLoader transform — 输入 shape=%s", df.shape)
+
+        df = df.copy()
+
+        # --- 提取 ID 列 ---
+        id_data = {}
+        for c in self.id_col_overlap:
+            if c in df.columns:
+                id_data[c] = df[c]
+
+        # 构建 event_id Series（用于最终输出）
+        event_id_col = self.id_cols[0] if self.id_cols else "event_id"
+        event_ids = df[event_id_col].copy() if event_id_col in df.columns else pd.Series(range(len(df)))
+
+        # --- 提取标签 ---
+        y = None
+        if has_label and self.label_col in df.columns:
+            y = df[self.label_col].map(self.label_encoder)
+            unknown = y.isna().sum()
+            if unknown > 0:
+                logger.warning("测试集中有 %d 个未知标签，填充为 -1", unknown)
+                y = y.fillna(-1)
+
+        # --- 丢弃 fit 时确定的列 ---
+        drop_all = list(set(self.id_col_overlap) | set(self.drop_cols))
+        if self.label_col in df.columns:
+            drop_all.append(self.label_col)
+        df = df.drop(columns=[c for c in drop_all if c in df.columns], errors="ignore")
+
+        # --- 缺失值填充（用 fit 时的统计量） ---
+        for col, med in self.numeric_medians.items():
+            if col in df.columns:
+                df[col] = df[col].fillna(med)
+        for col, mode_val in self.categorical_modes.items():
+            if col in df.columns:
+                df[col] = df[col].fillna(mode_val)
+
+        # --- 只保留 fit 时记录的列 ---
+        cols_available = [c for c in self.feature_order if c in df.columns]
+        missing_cols = set(self.feature_order) - set(cols_available)
+        if missing_cols:
+            logger.warning("测试集缺少 %d 个训练时的列，补 0: %s", len(missing_cols), list(missing_cols)[:5])
+            for mc in missing_cols:
+                df[mc] = 0
+
+        extra_cols = [c for c in df.columns if c not in self.feature_order]
+        if extra_cols:
+            logger.info("测试集多出 %d 个列，丢弃: %s", len(extra_cols), extra_cols[:5])
+            df = df.drop(columns=extra_cols)
+
+        X = df[self.feature_order].copy()
+
+        return X, y, event_ids
+
+    # ================================================================
+    # fit_transform — 一步完成
+    # ================================================================
+    def fit_transform(self, df: pd.DataFrame, has_label: bool = True) -> Tuple[pd.DataFrame, Optional[pd.Series], Optional[pd.Series]]:
+        self.fit(df)
+        return self.transform(df, has_label=has_label)
+
+    # ================================================================
+    # 分层划分
+    # ================================================================
+    def stratified_split(
+        self,
+        X: pd.DataFrame,
+        y: pd.Series,
+    ) -> Tuple[pd.DataFrame, pd.Series, pd.DataFrame, pd.Series]:
+        """分层划分为 train + val"""
+        test_size = self.cfg.get("data", {}).get("val_size", 0.15)
+        random_state = self.cfg.get("data", {}).get("random_state", 42)
+
+        sss = StratifiedShuffleSplit(
+            n_splits=1,
+            test_size=test_size,
+            random_state=random_state,
+        )
+        train_idx, val_idx = next(sss.split(X, y))
+
+        X_train = X.iloc[train_idx].reset_index(drop=True)
+        y_train = y.iloc[train_idx].reset_index(drop=True)
+        X_val = X.iloc[val_idx].reset_index(drop=True)
+        y_val = y.iloc[val_idx].reset_index(drop=True)
+
+        logger.info("分层划分: train=%d, val=%d", len(X_train), len(X_val))
+        return X_train, y_train, X_val, y_val
+
+    # ================================================================
+    # 完整流程
+    # ================================================================
+    def load_train(self) -> pd.DataFrame:
+        """加载训练集原始数据"""
+        raw_dir = self.cfg.paths["raw_dir"]
+        train_path = os.path.join(raw_dir, self.cfg.get("data", {}).get("train_file", "train.csv"))
+        return self._read_file(train_path)
+
+    def load_test(self) -> pd.DataFrame:
+        """加载测试集原始数据"""
+        raw_dir = self.cfg.paths["raw_dir"]
+        test_path = os.path.join(raw_dir, self.cfg.get("data", {}).get("test_file", "test.csv"))
+        return self._read_file(test_path)
+
+    def fulL_pipeline(self) -> Tuple[pd.DataFrame, pd.Series, pd.DataFrame, pd.Series, pd.DataFrame, pd.Series, list]:
+        """
+        完整训练流程: 加载 → fit_transform → 分层划分
+        返回: X_train, y_train, X_val, y_val, X_full, y_full, event_ids
+        """
+        train_df = self.load_train()
+
+        # 整体 fit
+        self.fit(train_df)
+        X, y, event_ids = self.transform(train_df, has_label=True)
+
+        # 分层划分（train 内部再分）
+        X_train, y_train, X_val, y_val = self.stratified_split(X, y)
+
+        logger.info(
+            "数据划分完成: train=%d (%.1f%%), val=%d (%.1f%%)",
+            len(X_train), len(X_train) / len(X) * 100,
+            len(X_val), len(X_val) / len(X) * 100,
+        )
+
+        # 保存划分数据
+        split_dir = self.cfg.paths["split_dir"]
+        os.makedirs(split_dir, exist_ok=True)
+        X_train.to_parquet(os.path.join(split_dir, "X_train.parquet"), index=False)
+        X_val.to_parquet(os.path.join(split_dir, "X_val.parquet"), index=False)
+        y_train.to_frame("label").to_parquet(os.path.join(split_dir, "y_train.parquet"), index=False)
+        y_val.to_frame("label").to_parquet(os.path.join(split_dir, "y_val.parquet"), index=False)
+
+        return X_train, y_train, X_val, y_val, X, y
+
+    # ================================================================
+    # 保存/加载
+    # ================================================================
+    def save(self, save_dir: str):
+        """保存 fit 状态"""
+        os.makedirs(save_dir, exist_ok=True)
+        state = {
+            "drop_cols": self.drop_cols,
+            "numeric_medians": self.numeric_medians,
+            "categorical_modes": self.categorical_modes,
+            "label_encoder": self.label_encoder,
+            "label_decoder": self.label_decoder,
+            "feature_order": self.feature_order,
+            "id_col_overlap": self.id_col_overlap,
+            "id_cols": self.id_cols,
+            "label_col": self.label_col,
+            "text_col": self.text_col,
+        }
+        with open(os.path.join(save_dir, "data_loader_state.pkl"), "wb") as f:
+            pickle.dump(state, f)
+        logger.info("DataLoader 状态已保存: %s", save_dir)
+
+    @classmethod
+    def load(cls, config: Config, save_dir: str) -> "DataLoader":
+        """加载 fit 状态"""
+        instance = cls(config)
+        path = os.path.join(save_dir, "data_loader_state.pkl")
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"DataLoader 状态文件不存在: {path}")
+
+        with open(path, "rb") as f:
+            state = pickle.load(f)
+
+        for k, v in state.items():
+            setattr(instance, k, v)
+        instance.fitted = True
+        logger.info("DataLoader 状态已加载: %s", save_dir)
+        return instance
