@@ -46,7 +46,7 @@ pip install -r requirements.txt
 python src/train.py
 
 # Prediction
-python src/predict.py --input data/valid_input.parquet --output outputs/pred.csv
+python src/predict.py --input data/valid_input.parquet --output outputs/res.csv
 ```
 
 ## Feature Engineering
