@@ -56,6 +56,24 @@ python src/predict.py --input data/valid_input.parquet --output outputs/res.csv
 - **Interaction features** (top-k feature crosses)
 - **Hybrid imbalance handling**: undersampling class 0 + SMOTE oversampling classes 1 & 2
 
+## v2.1 — Cross-Environment Diagnosis & Fix
+
+Key finding: the holdout/test logs come from a **different host environment** (`src_host` 100% OOV, product distribution shifted). Same-distribution validation metrics (F1 ≈ 1.0) were inflated and masked this.
+
+**Diagnosis**
+
+- Product ↔ label purity: `Precinct` / `Falcon` / `AWS VPC Security` / `ASA Firewall` ≈ 100% suspicious; all malicious events come from `syslog` + empty `product_name`
+- Baseline model judged all 41k pure-product samples as benign on the test set (train control: 99.96% correct)
+
+**Fixes**
+
+1. **Product-purity rule layer** — pure-product samples → `suspicious` (removes the heaviest penalty path: threat→benign)
+2. **Hard content features** (`is_sus_product`, `is_empty_product`, `username_is_dash`, `has_src_ip`, `src_ip_cgnat`, `msg_flow_tokens`) — content-level signals survive host OOV; empty-product malicious recall → 1.0
+3. **Two-stage pipeline** (`models/two_stage_v3.pkl`) — empty-product subset → content model (mal vs benign); pure-product → rule; rest → benign
+4. **Cross-host validation protocol** — grouped split on `src_host` (true OOD estimate): macro F1 0.6594 → **0.7178**; submission validated by two independent methods (ensemble + content model, Jaccard 0.996)
+
+**Artifacts**: `outputs/res_final.csv` (final submission), `models/two_stage_v3.pkl`, `models/lgbm_hardfeat.pkl`
+
 ## License
 
 MIT

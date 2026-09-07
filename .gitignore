@@ -71,3 +71,11 @@ logs/*
 
 # Backups
 *.bak
+
+# Data — too large for GitHub (download separately)
+data/
+!data/.gitkeep
+
+# Cache
+cache/*
+!cache/.gitkeep
